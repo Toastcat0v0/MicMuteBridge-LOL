@@ -1,0 +1,11 @@
+设计参考（非 DeMic 官方发行版）：
+DeMic v1.3.7 release: https://github.com/mkch/DeMic/releases/tag/v1.3.7
+DeMic source MicCtrl.cpp: https://github.com/mkch/DeMic/blob/v1.3.7/MicCtrl.cpp
+DeMic MIT license: https://github.com/mkch/DeMic/blob/v1.3.7/LICENSE
+微软 Core Audio 端点枚举：
+https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-enumaudioendpoints
+微软设备通知：
+https://learn.microsoft.com/en-us/windows/win32/coreaudio/device-events
+
+仅借鉴独立设计思路：活动录音设备发现、状态显示与设备错误处理。
+本项目不直接包含 DeMic 的代码、图标或资源，不声称与原作者有关联。

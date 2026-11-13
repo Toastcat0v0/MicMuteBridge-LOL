@@ -1,3 +1,0 @@
-LIBRARY HotKeyPlus
-EXPORTS
-	GetPluginInfo

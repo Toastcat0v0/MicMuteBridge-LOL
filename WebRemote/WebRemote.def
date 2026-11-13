@@ -1,3 +1,0 @@
-LIBRARY WebRemote
-EXPORTS
-	GetPluginInfo
