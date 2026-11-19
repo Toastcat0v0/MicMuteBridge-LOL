@@ -24,7 +24,7 @@ namespace MicMuteBridge
             var messages = new List<string>();
             string backup = path + ".bak";
             Settings fresh = Settings.LoadFrom(path, messages.Add);
-            Require(fresh.FirstRun && fresh.WarmupMs == 300, "Fresh settings did not load defaults.");
+            Require(fresh.FirstRun && fresh.WarmupMs == 100, "Fresh settings did not load defaults.");
 
             string micId = "{test-capture-endpoint}";
             File.WriteAllLines(path, new[] {
@@ -108,7 +108,7 @@ namespace MicMuteBridge
             oldFormat.SaveTo(path, messages.Add);
             Require(Settings.LoadFrom(path, messages.Add).DesktopKeys.Serialize() == "3,77",
                 "The desktop combination did not round-trip.");
-            Require(!DesktopShortcut.Parse("3,123").Enabled && !DesktopShortcut.Parse("8,77").Enabled &&
+            Require(DesktopShortcut.Parse("3,123").Enabled && !DesktopShortcut.Parse("3,124").Enabled && !DesktopShortcut.Parse("8,77").Enabled &&
                 !DesktopShortcut.Parse("broken").Enabled, "An unsupported desktop combination was accepted.");
 
             oldFormat.DesktopKeys = DesktopShortcut.Parse("chord:0101+0025+0024+0026");
@@ -451,6 +451,7 @@ try {
     $env:TEMP = $work
     $env:TMP = $work
     Copy-Item -LiteralPath (Join-Path $path 'BUILD.ps1') -Destination $work
+    Copy-Item -LiteralPath (Join-Path $path 'app.ico') -Destination $work
     Copy-Item -LiteralPath (Join-Path $path 'MicMuteBridge.cs') -Destination $work
     Copy-Item -LiteralPath (Join-Path $path 'Sounds') -Destination $work -Recurse
 

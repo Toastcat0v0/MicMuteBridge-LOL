@@ -74,11 +74,27 @@ namespace MicMuteBridge
         [FieldOffset(8)] public IntPtr pointer;
     }
 
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("657804FA-D6AD-4496-8A60-352752AF4F89")]
+    internal interface IAudioEndpointVolumeCallback
+    {
+        void OnNotify(IntPtr notifyData);
+    }
+
+    internal sealed class SpeakerVolumeNotification : IAudioEndpointVolumeCallback
+    {
+        private readonly Action onVolumeChanged;
+        public SpeakerVolumeNotification(Action callback) { onVolumeChanged = callback; }
+        public void OnNotify(IntPtr notifyData)
+        {
+            try { onVolumeChanged(); } catch { }
+        }
+    }
+
     [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
     internal interface IAudioEndpointVolume
     {
-        void RegisterControlChangeNotify(IntPtr callback);
-        void UnregisterControlChangeNotify(IntPtr callback);
+        void RegisterControlChangeNotify([MarshalAs(UnmanagedType.Interface)] IAudioEndpointVolumeCallback callback);
+        void UnregisterControlChangeNotify([MarshalAs(UnmanagedType.Interface)] IAudioEndpointVolumeCallback callback);
         void GetChannelCount(out uint count);
         void SetMasterVolumeLevel(float level, IntPtr eventContext);
         void SetMasterVolumeLevelScalar(float level, IntPtr eventContext);
@@ -122,6 +138,8 @@ namespace MicMuteBridge
             if (readable == 0) return AllMicAction.Hold;
             // Retry a partial unmute only for the same devices. Wait for a
             // complete scan before deciding whether the device set has changed.
+            if (unmuteRetryIds.Count > 0 && failures == 0 && !unmuteRetryIds.SetEquals(readableIds))
+                unmuteRetryIds.Clear();
             bool retry = unmuteRetryIds.Count > 0 &&
                 (failures > 0 || (muted > 0 && unmuteRetryIds.SetEquals(readableIds)));
             if (!explicitUnmute && !retry && muted < readable) return AllMicAction.Mute;
@@ -226,6 +244,34 @@ namespace MicMuteBridge
             return results;
         }
 
+        public string NameOf(string id)
+        {
+            if (String.IsNullOrEmpty(id)) return null;
+            IMMDevice dev = null;
+            IPropertyStore store = null;
+            try
+            {
+                enumerator.GetDevice(id, out dev);
+                dev.OpenPropertyStore(0, out store); // STGM_READ
+                PropertyKey key = friendlyKey;
+                PropVariant variant = new PropVariant();
+                try
+                {
+                    store.GetValue(ref key, out variant);
+                    if (variant.type == 31 && variant.pointer != IntPtr.Zero) // VT_LPWSTR
+                        return Marshal.PtrToStringUni(variant.pointer);
+                }
+                finally { PropVariantClear(ref variant); }
+            }
+            catch { }
+            finally
+            {
+                if (store != null) Marshal.ReleaseComObject(store);
+                if (dev != null) Marshal.ReleaseComObject(dev);
+            }
+            return null;
+        }
+
         public IAudioEndpointVolume Volume(string id)
         {
             IMMDevice dev = null;
@@ -266,7 +312,7 @@ namespace MicMuteBridge
             string sourceLogs = sourceSettings != null ? Path.Combine(sourceSettings, "logs") : null;
 
             // 2. 同级目录自动继承：扫描上一级目录下的兄弟文件夹，寻找最新的 Settings\settings.txt
-            if (sourceSettings == null)
+            if (sourceSettings == null && promptUser)
             {
                 string sibling = FindSiblingSettings();
                 if (sibling != null)
@@ -327,6 +373,8 @@ namespace MicMuteBridge
                     string file = Path.Combine(candidate, "settings.txt");
                     if (File.Exists(file))
                     {
+                        string content = File.ReadAllText(file, Encoding.UTF8);
+                        if (!content.Contains("mic_id=") && !content.Contains("settings_format=")) continue;
                         DateTime writeTime = File.GetLastWriteTimeUtc(file);
                         if (writeTime > latestTime)
                         {
@@ -457,7 +505,7 @@ namespace MicMuteBridge
         {
             for (int i = 0; i < Milliseconds.Length; ++i)
                 if (Milliseconds[i] == ms) return i;
-            return 5; // verified 300ms default
+            return 1; // 100ms default
         }
     }
 
@@ -476,7 +524,7 @@ namespace MicMuteBridge
         public bool Bridge = true;
         public bool Sound = true;
         // Milliseconds of in-stream silence before sound (never delays microphone control).
-        public int WarmupMs = 300;
+        public int WarmupMs = 100;
         public int SoundVolumePercent = 100; // 0-100: applies to cue samples only, never system volume.
         public int MuteTrimStartMs = 0;
         public int MuteTrimEndMs = 0; // 0 means natural end of source.
@@ -737,11 +785,18 @@ namespace MicMuteBridge
                 rows.Add("MicMuteBridgeMuteSessionV2");
                 foreach (var entry in previous)
                     rows.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(entry.Key)) + "|" + (entry.Value ? "1" : "0"));
-                string temp = FileName + ".tmp";
-                File.WriteAllLines(temp, rows.ToArray(), Encoding.UTF8);
-                if (File.Exists(FileName)) File.Replace(temp, FileName, null);
-                else File.Move(temp, FileName);
-                return true;
+                string temp = FileName + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    File.WriteAllLines(temp, rows.ToArray(), Encoding.UTF8);
+                    if (File.Exists(FileName)) File.Replace(temp, FileName, null);
+                    else File.Move(temp, FileName);
+                    return true;
+                }
+                finally
+                {
+                    try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+                }
             }
             catch (Exception ex)
             {
@@ -1097,45 +1152,204 @@ namespace MicMuteBridge
         [DllImport("user32.dll")]
         private static extern bool DestroyIcon(IntPtr handle);
 
+        private static Icon cachedAppIcon;
+        public static Icon AppIcon
+        {
+            get
+            {
+                if (cachedAppIcon == null)
+                {
+                    try { cachedAppIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+                    catch { }
+                }
+                return cachedAppIcon;
+            }
+        }
+
+        private static System.Drawing.Drawing2D.GraphicsPath RoundedRect(RectangleF r, float radius)
+        {
+            float d = radius * 2f;
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
         public static Icon Make(int kind)
         {
-            // kind: 0 = on, 1 = all muted, 2 = unknown, 3 = partial or partial failure.
-            Color fill = kind == 0 ? Color.FromArgb(32, 149, 93) :
-                kind == 1 ? Color.FromArgb(205, 65, 69) :
-                kind == 3 ? Color.FromArgb(221, 144, 22) : Color.FromArgb(112, 118, 126);
+            // kind: 0 = on (mint green), 1 = all muted (berry pink), 2 = unknown (lavender gray), 3 = partial (peach orange).
+            Color fill = kind == 0 ? Color.FromArgb(37, 184, 128) :
+                kind == 1 ? Color.FromArgb(235, 94, 141) :
+                kind == 3 ? Color.FromArgb(245, 158, 66) : Color.FromArgb(148, 136, 178);
             using (var bmp = new Bitmap(32, 32))
             using (Graphics g = Graphics.FromImage(bmp))
             {
-                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
                 g.Clear(Color.Transparent);
-                using (Brush bg = new SolidBrush(fill)) g.FillEllipse(bg, 1, 1, 30, 30);
+                using (Brush bg = new SolidBrush(fill)) g.FillEllipse(bg, 1.5F, 1.5F, 29F, 29F);
+                using (Pen ring = new Pen(Color.FromArgb(245, 255, 255, 255), 1.8F)) g.DrawEllipse(ring, 1.5F, 1.5F, 29F, 29F);
+                using (var cap = RoundedRect(new RectangleF(11.8F, 6.5F, 8.4F, 11.2F), 4.2F))
                 using (Brush white = new SolidBrush(Color.White))
                 using (Pen p = new Pen(Color.White, 2.3F))
                 {
                     p.StartCap = System.Drawing.Drawing2D.LineCap.Round;
                     p.EndCap = System.Drawing.Drawing2D.LineCap.Round;
-                    g.FillEllipse(white, 13, 7, 6, 12);
-                    g.DrawArc(p, 10, 11, 12, 12, 0, 180);
-                    g.DrawLine(p, 16, 23, 16, 26);
-                    g.DrawLine(p, 12, 26, 20, 26);
+                    g.FillPath(white, cap);
+                    if (kind == 0)
+                    {
+                        using (Brush blush = new SolidBrush(Color.FromArgb(255, 142, 168)))
+                        {
+                            g.FillEllipse(blush, 12.6F, 11.8F, 2.0F, 1.5F);
+                            g.FillEllipse(blush, 17.4F, 11.8F, 2.0F, 1.5F);
+                        }
+                    }
+                    g.DrawArc(p, 9.2F, 8.5F, 13.6F, 13.2F, 8, 164);
+                    g.DrawLine(p, 16F, 21.8F, 16F, 25.2F);
+                    g.DrawLine(p, 12F, 25.2F, 20F, 25.2F);
                 }
                 if (kind != 0)
                 {
-                    using (Pen slashBorder = new Pen(fill, 5F))
-                    using (Pen slash = new Pen(Color.White, 2.8F))
+                    using (Pen slashBorder = new Pen(fill, 5.0F))
+                    using (Pen slash = new Pen(Color.White, 2.6F))
                     {
                         slashBorder.StartCap = System.Drawing.Drawing2D.LineCap.Round;
                         slashBorder.EndCap = System.Drawing.Drawing2D.LineCap.Round;
                         slash.StartCap = System.Drawing.Drawing2D.LineCap.Round;
                         slash.EndCap = System.Drawing.Drawing2D.LineCap.Round;
-                        g.DrawLine(slashBorder, 8, 25, 24, 7);
-                        g.DrawLine(slash, 8, 25, 24, 7);
+                        g.DrawLine(slashBorder, 8.2F, 23.8F, 23.8F, 8.2F);
+                        g.DrawLine(slash, 8.2F, 23.8F, 23.8F, 8.2F);
                     }
                 }
                 IntPtr h = bmp.GetHicon();
                 try { return (Icon)Icon.FromHandle(h).Clone(); }
                 finally { DestroyIcon(h); }
             }
+        }
+    }
+
+    internal static class UiTheme
+    {
+        public static readonly Color WindowBg = Color.FromArgb(247, 244, 255);
+        public static readonly Color CardBg = Color.White;
+        public static readonly Color CardBorder = Color.FromArgb(226, 216, 248);
+        public static readonly Color SubHeaderBg = Color.FromArgb(244, 239, 255);
+        public static readonly Color InputBg = Color.FromArgb(250, 248, 255);
+        public static readonly Color TextMain = Color.FromArgb(59, 46, 88);
+        public static readonly Color TextSub = Color.FromArgb(110, 93, 145);
+        public static readonly Color Primary = Color.FromArgb(139, 104, 240);
+        public static readonly Color PrimaryHover = Color.FromArgb(122, 86, 227);
+        public static readonly Color SoftBg = Color.FromArgb(243, 238, 255);
+        public static readonly Color SoftHover = Color.FromArgb(232, 223, 255);
+        public static readonly Color SoftBorder = Color.FromArgb(216, 202, 250);
+        public static readonly Color SoftText = Color.FromArgb(91, 63, 168);
+
+        public static readonly Color MuteBg = Color.FromArgb(255, 240, 245);
+        public static readonly Color MuteRowBg = Color.FromArgb(255, 245, 248);
+        public static readonly Color MuteBorder = Color.FromArgb(246, 198, 216);
+        public static readonly Color MuteAccent = Color.FromArgb(230, 85, 128);
+        public static readonly Color MuteText = Color.FromArgb(201, 59, 107);
+
+        public static readonly Color UnmuteBg = Color.FromArgb(237, 252, 246);
+        public static readonly Color UnmuteRowBg = Color.FromArgb(242, 253, 248);
+        public static readonly Color UnmuteBorder = Color.FromArgb(182, 238, 216);
+        public static readonly Color UnmuteAccent = Color.FromArgb(32, 180, 124);
+        public static readonly Color UnmuteText = Color.FromArgb(21, 132, 90);
+
+        public static readonly Color WarnBg = Color.FromArgb(255, 248, 235);
+        public static readonly Color WarnRowBg = Color.FromArgb(255, 250, 240);
+        public static readonly Color WarnBorder = Color.FromArgb(247, 214, 168);
+        public static readonly Color WarnAccent = Color.FromArgb(235, 145, 38);
+        public static readonly Color WarnText = Color.FromArgb(180, 100, 16);
+
+        public static readonly Font FontRegular = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Regular);
+        public static readonly Font FontBold = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold);
+        public static readonly Font FontSmall = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Regular);
+        public static readonly Font FontSmallBold = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
+        public static readonly Font FontCardTitle = new Font("Microsoft YaHei UI", 10.2F, FontStyle.Bold);
+        public static readonly Font FontHero = new Font("Microsoft YaHei UI", 13.5F, FontStyle.Bold);
+        public static readonly Font FontMono = new Font("Consolas", 9F, FontStyle.Regular);
+
+        public static void StyleForm(Form form)
+        {
+            form.BackColor = WindowBg;
+            form.ForeColor = TextMain;
+            form.Font = FontRegular;
+            Icon appIcon = TrayIcons.AppIcon;
+            if (appIcon != null) form.Icon = appIcon;
+        }
+
+        public static Button MakeButton(Control parent, string text, int x, int y, int w, int h, bool primary, EventHandler click)
+        {
+            var btn = new Button
+            {
+                Text = text,
+                FlatStyle = FlatStyle.Flat,
+                Font = primary ? FontBold : FontRegular,
+                BackColor = primary ? Primary : SoftBg,
+                ForeColor = primary ? Color.White : SoftText,
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false
+            };
+            btn.FlatAppearance.BorderSize = 1;
+            btn.FlatAppearance.BorderColor = primary ? PrimaryHover : SoftBorder;
+            btn.FlatAppearance.MouseOverBackColor = primary ? PrimaryHover : SoftHover;
+            btn.SetBounds(x, y, w, h);
+            if (click != null) btn.Click += click;
+            if (parent != null) parent.Controls.Add(btn);
+            return btn;
+        }
+
+        public static Label MakeBadge(Control parent, string text, int x, int y, int w, int h)
+        {
+            var badge = new Label
+            {
+                Text = text,
+                Font = FontSmallBold,
+                BackColor = SoftBg,
+                ForeColor = SoftText,
+                TextAlign = ContentAlignment.MiddleCenter,
+                BorderStyle = BorderStyle.None
+            };
+            badge.SetBounds(x, y, w, h);
+            if (parent != null) parent.Controls.Add(badge);
+            return badge;
+        }
+    }
+
+    internal sealed class ThemedCard : Panel
+    {
+        public Color FillColor = UiTheme.CardBg;
+        public Color StrokeColor = UiTheme.CardBorder;
+        public int CornerRadius = 10;
+
+        public ThemedCard()
+        {
+            DoubleBuffered = true;
+            BackColor = Color.Transparent;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            Rectangle rect = new Rectangle(0, 0, Width - 1, Height - 1);
+            int d = CornerRadius * 2;
+            using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                path.AddArc(rect.X, rect.Y, d, d, 180, 90);
+                path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+                path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
+                path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
+                path.CloseFigure();
+                using (var fill = new SolidBrush(FillColor))
+                    e.Graphics.FillPath(fill, path);
+                using (var pen = new Pen(StrokeColor, 1.2F))
+                    e.Graphics.DrawPath(pen, path);
+            }
+            base.OnPaint(e);
         }
     }
 
@@ -1166,7 +1380,7 @@ namespace MicMuteBridge
         {
             return (key >= Keys.A && key <= Keys.Z) ||
                 (key >= Keys.D0 && key <= Keys.D9) ||
-                (key >= Keys.F1 && key <= Keys.F11) ||
+                (key >= Keys.F1 && key <= Keys.F12) ||
                 key == Keys.Home || key == Keys.End || key == Keys.Insert ||
                 key == Keys.PageUp || key == Keys.PageDown || key == Keys.Scroll;
         }
@@ -1568,9 +1782,32 @@ namespace MicMuteBridge
             return key == (int)Keys.Decimal && GetAsyncKeyState((int)Keys.Delete) < 0;
         }
 
+        private void PurgeStaleHeldKeys(ushort currentKey)
+        {
+            List<ushort> stale = null;
+            foreach (var pair in virtualKeys)
+            {
+                if (pair.Key != currentKey && pair.Value != 0 && !IsKeyDown(pair.Value))
+                {
+                    if (stale == null) stale = new List<ushort>();
+                    stale.Add(pair.Key);
+                }
+            }
+            if (stale == null) return;
+            foreach (ushort k in stale)
+            {
+                held.Remove(k);
+                virtualKeys.Remove(k);
+                foreach (var devKeys in devices.Values) devKeys.Remove(k);
+            }
+            activation.Set(activation.Chord, held);
+        }
+
         private void ChangeKey(IntPtr device, ushort key, bool pressed, int virtualKey)
         {
             if (waitingForRelease) return;
+            if (pressed && recording == null && !paused && held.Count > 0)
+                PurgeStaleHeldKeys(key);
             HashSet<ushort> keys;
             if (!devices.TryGetValue(device, out keys))
             {
@@ -1598,12 +1835,6 @@ namespace MicMuteBridge
                 recordingChanged(result, recording.Invalid ? (held.Contains(GameKeyMap.VolumeMute) ?
                     "扬声器静音键用于上方游戏单键，请松开后换一组。" : "请松开所有键，再同时按住要录制的组合。") :
                     recording.Candidate != null ? recording.Candidate.ToString() : DesktopChordRecording.Instructions);
-            }
-            else if (pressed && !paused && activation.Chord != null && activation.Chord.Contains(key) &&
-                virtualKeys.Any(pair => pair.Key != key && pair.Value != 0 && !IsKeyDown(pair.Value)))
-            {
-                // Discard stale state if an earlier key-up was missed, for example during a desktop switch.
-                ResetInput();
             }
             else if (activation.Update(held, pressed) && !paused) onPressed();
         }
@@ -2100,6 +2331,7 @@ namespace MicMuteBridge
         private const int AudioRetryIntervalMs = 2000;
         private const string AudioWaitingText = "等待 Windows 音频";
         private readonly Settings cfg;
+        private readonly SynchronizationContext uiContext;
         private readonly Stopwatch audioRetryWait = new Stopwatch();
         private AudioSystem audio;
         private IAudioEndpointVolume output;
@@ -2140,6 +2372,7 @@ namespace MicMuteBridge
 
         public BridgeContext()
         {
+            uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
             cfg = Settings.Load();
             if (MuteSessionStore.Load(previousAllStates))
                 Diagnostics.Write("发现上次闭麦记录，仅供诊断。启动时只读取麦克风状态。");
@@ -2221,6 +2454,7 @@ namespace MicMuteBridge
         }
         public bool AllMicsOn { get { return cfg.AllMics; } }
         public string AllMicStatus { get { return audio == null ? AudioWaitingText : allMicStatus; } }
+        public IList<MicStateEntry> MicStates { get { return currentMicStates; } }
         public string MicDetails
         {
             get
@@ -2257,9 +2491,35 @@ namespace MicMuteBridge
             catch (Exception ex) { LogError("刷新麦克风列表失败：" + Error(ex)); return new List<AudioDevice>(); }
         }
 
+        private SpeakerVolumeNotification outputCallback;
+        private int pendingOutputCheck;
+
+        private void OnSpeakerEndpointNotify()
+        {
+            if (exiting || Interlocked.Exchange(ref pendingOutputCheck, 1) != 0) return;
+            try
+            {
+                uiContext.Post(_ =>
+                {
+                    Interlocked.Exchange(ref pendingOutputCheck, 0);
+                    CheckSpeakerBridge();
+                }, null);
+            }
+            catch { Interlocked.Exchange(ref pendingOutputCheck, 0); }
+        }
+
         private void FreeOutput()
         {
-            if (output != null) { try { Marshal.ReleaseComObject(output); } catch { } output = null; }
+            if (output != null)
+            {
+                if (outputCallback != null)
+                {
+                    try { output.UnregisterControlChangeNotify(outputCallback); } catch { }
+                    outputCallback = null;
+                }
+                try { Marshal.ReleaseComObject(output); } catch { }
+                output = null;
+            }
             activeOutputId = "";
         }
 
@@ -2271,6 +2531,11 @@ namespace MicMuteBridge
 
         private string FindName(EDataFlow flow, string id)
         {
+            if (audio != null && !String.IsNullOrEmpty(id))
+            {
+                string directName = audio.NameOf(id);
+                if (!String.IsNullOrEmpty(directName)) return directName;
+            }
             try
             {
                 foreach (AudioDevice device in audio.List(flow))
@@ -2301,6 +2566,8 @@ namespace MicMuteBridge
                 activeOutputId = wanted;
                 activeOutputName = FindName(EDataFlow.Render, wanted);
                 output.GetMute(out outputLastMuted); // baseline: never trigger on a device switch
+                outputCallback = new SpeakerVolumeNotification(OnSpeakerEndpointNotify);
+                try { output.RegisterControlChangeNotify(outputCallback); } catch { outputCallback = null; }
                 Log("已自动切换监听：" + activeOutputName + (outputLastMuted ? "（当前系统已静音，请先自行恢复）" : ""));
             }
             catch (Exception ex)
@@ -2661,9 +2928,26 @@ namespace MicMuteBridge
         public string MutePreset { get { return cfg.MutePreset; } }
         public string UnmutePreset { get { return cfg.UnmutePreset; } }
 
+        private bool EnsureSoundPlayer()
+        {
+            if (sound != null) return true;
+            try
+            {
+                sound = new TonePlayer(cfg.MutePreset, cfg.UnmutePreset,
+                    cfg.MuteTrimStartMs, cfg.MuteTrimEndMs, cfg.UnmuteTrimStartMs, cfg.UnmuteTrimEndMs,
+                    cfg.SoundVolumePercent);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogError("音效播放器重新初始化失败：" + Error(ex));
+                return false;
+            }
+        }
+
         public bool ChooseSoundPreset(bool muted, string id)
         {
-            if (sound == null) { Log("音效播放器不可用，无法设置音效"); return false; }
+            if (!EnsureSoundPlayer()) { Log("音效播放器不可用，无法设置音效"); return false; }
             id = SoundCatalog.SafeId(id);
             try
             {
@@ -2716,6 +3000,7 @@ namespace MicMuteBridge
                 }
                 // Re-import may replace a custom file with a different duration.
                 // Explicitly reset old trimming; stale offsets must not survive.
+                if (!EnsureSoundPlayer()) throw new InvalidOperationException("音效播放器未能初始化。");
                 sound.SetCue(muted, "custom", 0, 0);
                 if (muted)
                 {
@@ -2749,7 +3034,7 @@ namespace MicMuteBridge
 
         public bool SetSoundTrim(bool muted, int startMs, int endMs)
         {
-            if (sound == null) return false;
+            if (!EnsureSoundPlayer()) return false;
             string preset = muted ? cfg.MutePreset : cfg.UnmutePreset;
             try
             {
@@ -2865,7 +3150,12 @@ namespace MicMuteBridge
                     UpdateUi();
                 }
             }
-            if (output == null) return;
+            CheckSpeakerBridge();
+        }
+
+        private void CheckSpeakerBridge()
+        {
+            if (exiting || output == null) return;
             try
             {
                 bool now;
@@ -3210,27 +3500,31 @@ namespace MicMuteBridge
         private const int WasDown = 1 << 30;
         private const string Instructions = "按下一个键，松开后选中。";
         private readonly HashSet<ushort> held = new HashSet<ushort>();
-        private readonly Label status = new Label { Text = Instructions };
+        private readonly Label status = new Label { Text = Instructions, Font = UiTheme.FontBold, ForeColor = UiTheme.SoftText, BackColor = Color.White };
         private GameKeyOption pending;
         private GameKeyOption selected;
 
         public GameKeyCaptureDialog()
         {
             Text = "录制游戏单键";
-            ClientSize = new Size(436, 126);
+            ClientSize = new Size(446, 146);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             ShowInTaskbar = false;
             MinimizeBox = false;
             MaximizeBox = false;
-            Font = new Font("Microsoft YaHei UI", 9.5F); try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            UiTheme.StyleForm(this);
 
-            status.SetBounds(16, 16, 404, 28);
-            var help = new Label { Text = "点击「取消」可退出。已映射的键可从列表选回。" };
-            help.SetBounds(16, 49, 404, 27);
-            var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel };
-            cancel.SetBounds(330, 81, 90, 30);
-            Controls.AddRange(new Control[] { status, help, cancel });
+            var card = new ThemedCard();
+            card.SetBounds(14, 14, 418, 76);
+            status.SetBounds(14, 14, 390, 26);
+            var help = new Label { Text = "点击「取消」可退出。已映射的键可从列表选回。", ForeColor = UiTheme.TextSub, BackColor = Color.White };
+            help.SetBounds(14, 44, 390, 24);
+            card.Controls.AddRange(new Control[] { status, help });
+            Controls.Add(card);
+
+            Button cancel = UiTheme.MakeButton(this, "取消", 342, 100, 90, 32, false, null);
+            cancel.DialogResult = DialogResult.Cancel;
             CancelButton = cancel;
         }
 
@@ -3298,7 +3592,7 @@ namespace MicMuteBridge
     internal sealed class DesktopShortcutDialog : Form, IMessageFilter
     {
         private readonly DesktopRawInput input;
-        private readonly Label status = new Label { Text = DesktopChordRecording.Instructions };
+        private readonly Label status = new Label { Text = DesktopChordRecording.Instructions, Font = UiTheme.FontBold, ForeColor = UiTheme.SoftText, BackColor = Color.White };
         private DesktopChord result;
         private bool recording;
 
@@ -3306,19 +3600,25 @@ namespace MicMuteBridge
         {
             input = listener;
             Text = "录制常规快捷键";
-            ClientSize = new Size(512, 147);
+            ClientSize = new Size(520, 162);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             ShowInTaskbar = false;
             MinimizeBox = false;
             MaximizeBox = false;
-            Font = new Font("Microsoft YaHei UI", 9.5F); try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-            status.SetBounds(16, 16, 480, 52);
-            var help = new Label { Text = "也可以只按一个键。点击「取消」退出。" };
-            help.SetBounds(16, 72, 480, 25);
-            var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel };
-            cancel.SetBounds(406, 102, 90, 31);
-            Controls.AddRange(new Control[] { status, help, cancel });
+            UiTheme.StyleForm(this);
+
+            var card = new ThemedCard();
+            card.SetBounds(14, 14, 492, 92);
+            status.SetBounds(14, 14, 464, 44);
+            var help = new Label { Text = "也可以只按一个键或鼠标侧键。点击「取消」退出。", ForeColor = UiTheme.TextSub, BackColor = Color.White };
+            help.SetBounds(14, 60, 464, 24);
+            card.Controls.AddRange(new Control[] { status, help });
+            Controls.Add(card);
+
+            Button cancel = UiTheme.MakeButton(this, "取消", 416, 116, 90, 32, false, null);
+            cancel.DialogResult = DialogResult.Cancel;
+            CancelButton = cancel;
         }
 
         public DesktopChord Record(IWin32Window owner)
@@ -3392,75 +3692,87 @@ namespace MicMuteBridge
         {
             core = context;
             Text = "MicMuteBridge · 麦克风快捷键设置";
-            ClientSize = new Size(640, 429);
+            ClientSize = new Size(640, 412);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            Font = new Font("Microsoft YaHei UI", 9.5F); try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            UiTheme.StyleForm(this);
 
-            GroupBox game = AddGroup("游戏单键 · 系统静音触发", 14, 162);
-            AddLabel(game, "检测到 Windows 扬声器静音后，自动恢复扬声器并切换麦克风。", 25, 23);
-            AddLabel(game, "此键在系统中改为扬声器静音，需管理员授权并重启。该方式已在国服 LOL 全屏验证。", 49, 25, true);
+            ThemedCard game = AddCard("🎮 游戏单键 · 系统静音触发（全屏 LOL 推荐）", 14, 158);
+            AddCardLabel(game, "检测到 Windows 扬声器静音后，毫秒级自动恢复扬声器并切换麦克风。", 40, 22, false);
+            AddCardLabel(game, "此键在系统中改为扬声器静音，需管理员授权并重启生效。", 63, 22, true);
             gameKeys.DropDownStyle = ComboBoxStyle.DropDownList;
             gameKeys.MaxDropDownItems = 16;
+            gameKeys.BackColor = UiTheme.InputBg;
+            gameKeys.ForeColor = UiTheme.TextMain;
             gameKeys.Items.AddRange(GameKeyMap.Choices);
             gameKeys.SelectedIndex = 0;
-            gameKeys.SetBounds(16, 88, 163, 30);
+            gameKeys.SetBounds(16, 92, 165, 30);
             game.Controls.Add(gameKeys);
-            AddButton(game, "录制单键…", 189, 86, 112, (s,e) => RecordGameKey());
-            AddButton(game, "应用系统单键…", 311, 86, 136, (s,e) =>
+            UiTheme.MakeButton(game, "录制单键…", 191, 90, 112, 32, false, (s,e) => RecordGameKey());
+            UiTheme.MakeButton(game, "应用系统单键…", 313, 90, 138, 32, true, (s,e) =>
                 GameKeySetup.Launch((GameKeyOption)gameKeys.SelectedItem, this));
-            AddButton(game, "撤回系统单键…", 457, 86, 135, (s,e) => GameKeySetup.Launch(null, this));
-            gameStatus.SetBounds(16, 128, 576, 24);
+            UiTheme.MakeButton(game, "撤回系统单键…", 461, 90, 131, 32, false, (s,e) => GameKeySetup.Launch(null, this));
+            gameStatus.SetBounds(16, 129, 576, 22);
+            gameStatus.Font = UiTheme.FontSmallBold;
+            gameStatus.ForeColor = UiTheme.SoftText;
+            gameStatus.BackColor = Color.White;
             game.Controls.Add(gameStatus);
 
-            GroupBox desktop = AddGroup("常规开关麦克风", 185, 184);
-            AddLabel(desktop, "可录制单键、同时按住的多个键或鼠标侧键。保存并关闭窗口后可用。", 25, 23);
-            AddLabel(desktop, "适合桌面和一般应用，无需管理员授权或重启。LOL 全屏请用上方游戏单键。", 49, 22, true);
-            desktopSelection.SetBounds(16, 78, 576, 30);
+            ThemedCard desktop = AddCard("🌸 常规开关麦克风（桌面 / 键鼠组合）", 184, 174);
+            AddCardLabel(desktop, "可录制单键、同时按住的多个键或鼠标侧键。保存后立即生效，无需重启。", 40, 22, false);
+            AddCardLabel(desktop, "适合桌面和一般应用；国服 LOL 等全屏反作弊游戏请使用上方游戏单键。", 63, 22, true);
+            desktopSelection.SetBounds(16, 90, 232, 30);
+            desktopSelection.BackColor = UiTheme.InputBg;
+            desktopSelection.ForeColor = UiTheme.TextMain;
+            desktopSelection.BorderStyle = BorderStyle.FixedSingle;
             desktopSelection.AccessibleName = "待保存的常规快捷键";
             desktop.Controls.Add(desktopSelection);
-            AddButton(desktop, "录制快捷键…", 16, 115, 116, (s,e) => RecordDesktop());
-            saveDesktop = AddButton(desktop, "保存快捷键", 142, 115, 101, (s,e) => ApplyDesktop(pendingDesktop));
-            AddButton(desktop, "关闭快捷键", 253, 115, 101, (s,e) => ApplyDesktop(default(DesktopShortcut)));
-            desktopStatus.SetBounds(16, 153, 576, 24);
+            UiTheme.MakeButton(desktop, "录制快捷键…", 258, 88, 116, 32, false, (s,e) => RecordDesktop());
+            saveDesktop = UiTheme.MakeButton(desktop, "保存快捷键", 382, 88, 104, 32, true, (s,e) => ApplyDesktop(pendingDesktop));
+            UiTheme.MakeButton(desktop, "关闭快捷键", 494, 88, 98, 32, false, (s,e) => ApplyDesktop(default(DesktopShortcut)));
+            desktopStatus.SetBounds(16, 132, 576, 24);
+            desktopStatus.Font = UiTheme.FontSmallBold;
+            desktopStatus.ForeColor = UiTheme.UnmuteText;
+            desktopStatus.BackColor = Color.White;
             desktop.Controls.Add(desktopStatus);
 
             SetDesktopSelection(core.SavedDesktopShortcut);
             RefreshDesktopStatus();
             RefreshGameStatus(true);
             Activated += (s,e) => RefreshGameStatus(false);
-            CancelButton = AddButton(this, "完成", 530, 382, 94, (s,e) => Close());
+            CancelButton = UiTheme.MakeButton(this, "完成返回", 514, 368, 110, 33, true, (s,e) => Close());
         }
 
-        private GroupBox AddGroup(string title, int top, int height)
+        private ThemedCard AddCard(string title, int top, int height)
         {
-            var box = new GroupBox { Text = title };
+            var box = new ThemedCard();
             box.SetBounds(16, top, 608, height);
+            var header = new Label
+            {
+                Text = title,
+                Font = UiTheme.FontCardTitle,
+                ForeColor = UiTheme.SoftText,
+                BackColor = Color.White
+            };
+            header.SetBounds(16, 12, 576, 24);
+            box.Controls.Add(header);
             Controls.Add(box);
             return box;
         }
 
-        private static void AddLabel(Control parent, string text, int top, int height, bool small = false)
+        private static void AddCardLabel(Control parent, string text, int top, int height, bool small)
         {
-            var label = new Label { Text = text };
-            if (small)
+            var label = new Label
             {
-                label.Font = new Font("Microsoft YaHei UI", 8.5F);
-                label.ForeColor = SystemColors.GrayText;
-            }
+                Text = text,
+                Font = small ? UiTheme.FontSmall : UiTheme.FontRegular,
+                ForeColor = small ? UiTheme.TextSub : UiTheme.TextMain,
+                BackColor = Color.White
+            };
             label.SetBounds(16, top, 576, height);
             parent.Controls.Add(label);
-        }
-
-        private static Button AddButton(Control parent, string text, int x, int y, int width, EventHandler click)
-        {
-            var button = new Button { Text = text };
-            button.SetBounds(x, y, width, 31);
-            button.Click += click;
-            parent.Controls.Add(button);
-            return button;
         }
 
         private void RecordGameKey()
@@ -3536,122 +3848,301 @@ namespace MicMuteBridge
         }
     }
 
+    internal sealed class MicListViewPanel : Panel
+    {
+        private readonly BridgeContext core;
+
+        public MicListViewPanel(BridgeContext context)
+        {
+            core = context;
+            DoubleBuffered = true;
+            AutoScroll = true;
+            BackColor = Color.White;
+        }
+
+        public void RefreshRows()
+        {
+            int count = core.AllMicsOn ? Math.Max(1, core.MicStates.Count) : 1;
+            AutoScrollMinSize = new Size(0, count * 34 + 8);
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            int y = 4 + AutoScrollPosition.Y;
+            int w = ClientSize.Width - 12;
+            if (w < 80) return;
+
+            if (!core.AllMicsOn)
+            {
+                DrawMicRow(e.Graphics, 6, y, w, core.MicName, core.MicMuted, "指定麦克风");
+                return;
+            }
+
+            IList<MicStateEntry> entries = core.MicStates;
+            if (entries.Count == 0)
+            {
+                using (var brush = new SolidBrush(UiTheme.TextSub))
+                    e.Graphics.DrawString("当前未发现可用的活动录音设备。", UiTheme.FontRegular, brush, 10, 12);
+                return;
+            }
+
+            for (int i = 0; i < entries.Count; i++)
+            {
+                MicStateEntry item = entries[i];
+                string rightTag = String.IsNullOrEmpty(item.Problem) ? "活动设备" : item.Problem;
+                DrawMicRow(e.Graphics, 6, y + i * 34, w, item.Name, item.Muted, rightTag);
+            }
+        }
+
+        private static void DrawMicRow(Graphics g, int x, int y, int w, string name, bool? muted, string rightTag)
+        {
+            Color rowBg = !muted.HasValue ? UiTheme.WarnRowBg : (muted.Value ? UiTheme.MuteRowBg : UiTheme.UnmuteRowBg);
+            Color border = !muted.HasValue ? UiTheme.WarnBorder : (muted.Value ? UiTheme.MuteBorder : UiTheme.UnmuteBorder);
+            Color dotColor = !muted.HasValue ? UiTheme.WarnAccent : (muted.Value ? UiTheme.MuteAccent : UiTheme.UnmuteAccent);
+            Color tagColor = !muted.HasValue ? UiTheme.WarnText : (muted.Value ? UiTheme.MuteText : UiTheme.UnmuteText);
+            string tag = !muted.HasValue ? "[未就绪]" : (muted.Value ? "[已静音]" : "[已开启]");
+
+            Rectangle rect = new Rectangle(x, y, w, 29);
+            using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                int d = 12;
+                path.AddArc(rect.X, rect.Y, d, d, 180, 90);
+                path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+                path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
+                path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
+                path.CloseFigure();
+                using (var fill = new SolidBrush(rowBg)) g.FillPath(fill, path);
+                using (var pen = new Pen(border, 1F)) g.DrawPath(pen, path);
+            }
+
+            using (var dotBrush = new SolidBrush(dotColor))
+                g.FillEllipse(dotBrush, x + 10, y + 9, 10, 10);
+            using (var tagBrush = new SolidBrush(tagColor))
+                g.DrawString(tag, UiTheme.FontSmallBold, tagBrush, x + 25, y + 6);
+
+            int nameX = x + 84;
+            int rightWidth = 90;
+            var nameRect = new RectangleF(nameX, y + 5, Math.Max(40, w - 92 - rightWidth), 20);
+            var format = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+            using (var nameBrush = new SolidBrush(UiTheme.TextMain))
+                g.DrawString(name ?? "", UiTheme.FontRegular, nameBrush, nameRect, format);
+
+            var rightRect = new RectangleF(x + w - rightWidth - 6, y + 6, rightWidth, 18);
+            var rightFormat = new StringFormat { Alignment = StringAlignment.Far, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+            using (var subBrush = new SolidBrush(UiTheme.TextSub))
+                g.DrawString(rightTag ?? "", UiTheme.FontSmall, subBrush, rightRect, rightFormat);
+        }
+    }
+
     internal sealed class SettingsForm : Form
     {
         private readonly BridgeContext core;
-        private readonly ComboBox micChoice = new ComboBox();
-        private readonly Label outputLabel = new Label();
-        private readonly Label micLabel = new Label();
+        private readonly ThemedCard heroCard = new ThemedCard();
         private readonly Label stateLabel = new Label();
-        private readonly Label counts = new Label();
-        private readonly CheckBox bridgeBox = new CheckBox();
+        private readonly Label countsBadge = new Label();
+        private readonly Label outputLabel = new Label();
+        private readonly Button heroToggleBtn;
+        private readonly ComboBox micChoice = new ComboBox();
         private readonly CheckBox allMicsBox = new CheckBox();
-        private readonly Button unmuteAllButton;
+        private readonly CheckBox bridgeBox = new CheckBox();
         private readonly CheckBox soundBox = new CheckBox();
-        private readonly ComboBox soundModeChoice = new ComboBox();
         private readonly CheckBox startupBox = new CheckBox();
+        private readonly ComboBox soundModeChoice = new ComboBox();
+        private readonly Button tabMicsBtn;
+        private readonly Button tabLogsBtn;
+        private readonly MicListViewPanel micListPanel;
         private readonly TextBox logText = new TextBox();
-        private readonly TextBox micDetailText = new TextBox();
+        private bool showingLogs;
         private bool syncing;
         public bool AllowClose;
 
         public SettingsForm(BridgeContext context)
         {
             core = context;
-            Text = "MicMuteBridge " + Program.Version + " · 详细设置";
-            ClientSize = new Size(720, 678);
-            MinimumSize = new Size(735, 710);
+            Text = "MicMuteBridge " + Program.Version + " · 麦克风静音助手";
+            ClientSize = new Size(680, 508);
+            MinimumSize = new Size(696, 545);
             StartPosition = FormStartPosition.CenterScreen;
-            Font = new Font("Microsoft YaHei UI", 9.5F); try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-            BackColor = Color.FromArgb(248, 249, 252);
+            UiTheme.StyleForm(this);
 
-            AddLabel("MicMuteBridge", 22, 16, 480, 38, 19F, true);
-            AddButton("快捷键设置…", 546, 20, 145, 32, (s,e) => core.OpenShortcutSettings());
-            AddLabel("左键点托盘图标可切麦。游戏单键和常规切麦键可在右上角设置。", 22, 60, 655, 29, 9.5F);
+            // 1. Hero Status Banner Card
+            heroCard.SetBounds(16, 14, 648, 86);
+            heroCard.FillColor = UiTheme.MuteBg;
+            heroCard.StrokeColor = UiTheme.MuteBorder;
 
-            stateLabel.SetBounds(22, 110, 665, 32);
-            stateLabel.Font = new Font("Microsoft YaHei UI", 13F, FontStyle.Bold);
-            Controls.Add(stateLabel);
-            outputLabel.SetBounds(22, 155, 665, 29);
-            Controls.Add(outputLabel);
-            micLabel.SetBounds(22, 190, 665, 29);
-            Controls.Add(micLabel);
+            stateLabel.SetBounds(16, 14, 340, 28);
+            stateLabel.Font = UiTheme.FontHero;
+            stateLabel.BackColor = Color.Transparent;
+            heroCard.Controls.Add(stateLabel);
 
-            AddLabel("麦克风控制目标（默认自动识别；可手动指定）", 22, 227, 660, 25, 10F, true);
-            micChoice.SetBounds(22, 255, 545, 31);
+            countsBadge = UiTheme.MakeBadge(heroCard, "已转换 0 次", 362, 17, 102, 23);
+
+            outputLabel.SetBounds(18, 49, 465, 23);
+            outputLabel.Font = UiTheme.FontRegular;
+            outputLabel.ForeColor = UiTheme.TextSub;
+            outputLabel.BackColor = Color.Transparent;
+            heroCard.Controls.Add(outputLabel);
+
+            heroToggleBtn = UiTheme.MakeButton(heroCard, "立即切换麦克风", 494, 22, 138, 42, true, (s,e) => core.ToggleMic("主窗口"));
+            Controls.Add(heroCard);
+
+            // 2. Left Card: Microphone Target
+            var leftCard = new ThemedCard();
+            leftCard.SetBounds(16, 112, 318, 146);
+            var leftTitle = new Label
+            {
+                Text = "🎙️ 麦克风控制目标",
+                Font = UiTheme.FontCardTitle,
+                ForeColor = UiTheme.SoftText,
+                BackColor = Color.White
+            };
+            leftTitle.SetBounds(14, 13, 180, 24);
+            leftCard.Controls.Add(leftTitle);
+            UiTheme.MakeButton(leftCard, "刷新列表", 224, 10, 80, 27, false, (s,e) => { core.RefreshDevices(); FillMicChoices(); });
+
+            allMicsBox.SetBounds(16, 46, 288, 26);
+            allMicsBox.Text = "自动控制全部活动麦克风（统一开关）";
+            allMicsBox.BackColor = Color.White;
+            allMicsBox.ForeColor = UiTheme.TextMain;
+            allMicsBox.CheckedChanged += (s,e) => { if (!syncing) { core.SetAllMics(allMicsBox.Checked); SyncFromContext(); } };
+            leftCard.Controls.Add(allMicsBox);
+
+            var targetHint = new Label
+            {
+                Text = "取消勾选后可手动指定单个麦克风：",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
+            };
+            targetHint.SetBounds(16, 76, 286, 19);
+            leftCard.Controls.Add(targetHint);
+
+            micChoice.SetBounds(16, 99, 286, 30);
             micChoice.DropDownStyle = ComboBoxStyle.DropDownList;
-            Controls.Add(micChoice);
+            micChoice.BackColor = UiTheme.InputBg;
+            micChoice.ForeColor = UiTheme.TextMain;
             micChoice.SelectedIndexChanged += (s,e) =>
             {
                 if (syncing) return;
                 AudioDevice chosen = micChoice.SelectedItem as AudioDevice;
                 if (chosen != null) core.SelectMic(chosen.Id);
             };
-            AddButton("刷新", 579, 255, 112, 31, (s,e) => { core.RefreshDevices(); FillMicChoices(); });
-            allMicsBox.SetBounds(22, 293, 463, 31);
-            allMicsBox.Text = "自动控制全部活动麦克风（下次按键统一开麦 / 闭麦）";
-            allMicsBox.CheckedChanged += (s,e) => { if (!syncing) { core.SetAllMics(allMicsBox.Checked); SyncFromContext(); } };
-            Controls.Add(allMicsBox);
-            unmuteAllButton = AddButton("确认打开全部麦克风…", 491, 293, 200, 31, (s,e) => core.ExplicitUnmuteAll(this));
+            leftCard.Controls.Add(micChoice);
+            Controls.Add(leftCard);
 
-            bridgeBox.SetBounds(22, 329, 350, 28);
-            bridgeBox.Text = "用扬声器静音键切换麦克风";
+            // 3. Right Card: Shortcuts & Sound
+            var rightCard = new ThemedCard();
+            rightCard.SetBounds(346, 112, 318, 146);
+            var rightTitle = new Label
+            {
+                Text = "✨ 快捷设置与提示音",
+                Font = UiTheme.FontCardTitle,
+                ForeColor = UiTheme.SoftText,
+                BackColor = Color.White
+            };
+            rightTitle.SetBounds(14, 13, 142, 24);
+            rightCard.Controls.Add(rightTitle);
+            UiTheme.MakeButton(rightCard, "快捷键…", 156, 10, 74, 27, true, (s,e) => core.OpenShortcutSettings());
+            UiTheme.MakeButton(rightCard, "音效库…", 234, 10, 72, 27, false, (s,e) => core.OpenSoundLibrary());
+
+            bridgeBox.SetBounds(16, 48, 152, 26);
+            bridgeBox.Text = "扬声器静音键切麦";
+            bridgeBox.BackColor = Color.White;
             bridgeBox.CheckedChanged += (s,e) => { if (!syncing) core.SetBridge(bridgeBox.Checked); };
-            Controls.Add(bridgeBox);
-            AddLabel("开启时按键切麦并恢复扬声器，关闭时只控制扬声器。", 40, 359, 335, 21, 8.5F);
-            soundBox.SetBounds(390, 329, 300, 28);
-            soundBox.Text = "播放开麦 / 闭麦提示音";
+            rightCard.Controls.Add(bridgeBox);
+
+            soundBox.SetBounds(172, 48, 138, 26);
+            soundBox.Text = "播放切麦提示音";
+            soundBox.BackColor = Color.White;
             soundBox.CheckedChanged += (s,e) => { if (!syncing) core.SetSound(soundBox.Checked); };
-            Controls.Add(soundBox);
-            startupBox.SetBounds(22, 383, 340, 29);
-            startupBox.Text = "登录 Windows 后自动启动（托盘常驻）";
+            rightCard.Controls.Add(soundBox);
+
+            startupBox.SetBounds(16, 84, 152, 26);
+            startupBox.Text = "开机自动常驻托盘";
+            startupBox.BackColor = Color.White;
             startupBox.CheckedChanged += (s,e) => { if (!syncing) core.SetStartup(startupBox.Checked); };
-            Controls.Add(startupBox);
-            AddLabel("预热时间", 390, 389, 74, 24, 9F);
-            soundModeChoice.SetBounds(465, 382, 226, 31);
+            rightCard.Controls.Add(startupBox);
+
+            var warmupLabel = new Label
+            {
+                Text = "预热:",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
+            };
+            warmupLabel.SetBounds(170, 88, 36, 22);
+            rightCard.Controls.Add(warmupLabel);
+
+            soundModeChoice.SetBounds(206, 83, 98, 28);
             soundModeChoice.DropDownStyle = ComboBoxStyle.DropDownList;
+            soundModeChoice.BackColor = UiTheme.InputBg;
+            soundModeChoice.ForeColor = UiTheme.TextMain;
+            soundModeChoice.Font = UiTheme.FontSmall;
             foreach (int ms in SoundWarmup.Milliseconds)
-                soundModeChoice.Items.Add(ms == 300 ? "300ms（已验证）" :
-                    ms == 0 ? "0ms（实验 / 可能吞音）" : ms + "ms（实验）");
+                soundModeChoice.Items.Add(ms == 100 ? "100ms(默认)" :
+                    ms == 300 ? "300ms(防吞)" :
+                    ms == 0 ? "0ms(无预热)" : ms + "ms");
             soundModeChoice.SelectedIndexChanged += (s,e) =>
             {
                 if (!syncing && soundModeChoice.SelectedIndex >= 0)
                     core.SetWarmupMs(SoundWarmup.Milliseconds[soundModeChoice.SelectedIndex]);
             };
-            Controls.Add(soundModeChoice);
+            rightCard.Controls.Add(soundModeChoice);
 
-            AddButton("立即切换麦克风", 22, 435, 156, 38, (s,e) => core.ToggleMic("主窗口"));
-            AddButton("试听闭麦", 186, 435, 112, 38, (s,e) => core.TestSound());
-            AddButton("音效库 / 音量…", 305, 435, 140, 38, (s,e) => core.OpenSoundLibrary());
-            AddButton("隐藏到托盘", 565, 435, 126, 38, (s,e) => Hide());
-            counts.SetBounds(459, 441, 105, 26);
-            Controls.Add(counts);
+            var bridgeTip = new Label
+            {
+                Text = "提示：左键单击右下角托盘图标也可随时切麦。",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
+            };
+            bridgeTip.SetBounds(16, 117, 290, 20);
+            rightCard.Controls.Add(bridgeTip);
+            Controls.Add(rightCard);
 
-            TabControl detailTabs = new TabControl();
-            detailTabs.SetBounds(22, 492, 669, 134);
-            TabPage devicesTab = new TabPage("麦克风明细");
-            TabPage logsTab = new TabPage("运行日志");
-            micDetailText.Dock = DockStyle.Fill;
-            micDetailText.Multiline = true;
-            micDetailText.ScrollBars = ScrollBars.Vertical;
-            micDetailText.ReadOnly = true;
-            micDetailText.WordWrap = false;
-            micDetailText.BackColor = Color.White;
-            micDetailText.Font = new Font("Microsoft YaHei UI", 9F);
-            devicesTab.Controls.Add(micDetailText);
-            logText.Dock = DockStyle.Fill;
+            // 4. Bottom Card (Plan B: Always-Visible Connected Microphones + Log Switcher)
+            var bottomCard = new ThemedCard();
+            bottomCard.SetBounds(16, 270, 648, 224);
+
+            var headerBar = new Panel
+            {
+                BackColor = UiTheme.SubHeaderBg
+            };
+            headerBar.SetBounds(2, 2, 644, 38);
+            tabMicsBtn = UiTheme.MakeButton(headerBar, "🎙️ 连接的麦克风", 10, 6, 152, 27, true, (s,e) => SwitchBottomView(false));
+            tabLogsBtn = UiTheme.MakeButton(headerBar, "📋 运行日志", 168, 6, 108, 27, false, (s,e) => SwitchBottomView(true));
+            UiTheme.MakeButton(headerBar, "打开日志文件夹", 422, 6, 104, 27, false, (s,e) => core.OpenLogFolder(false));
+            UiTheme.MakeButton(headerBar, "打开报错文件夹", 532, 6, 104, 27, false, (s,e) => core.OpenLogFolder(true));
+            bottomCard.Controls.Add(headerBar);
+
+            micListPanel = new MicListViewPanel(core);
+            micListPanel.SetBounds(8, 44, 632, 150);
+            bottomCard.Controls.Add(micListPanel);
+
+            logText.SetBounds(10, 46, 628, 146);
             logText.Multiline = true;
             logText.ScrollBars = ScrollBars.Vertical;
             logText.ReadOnly = true;
-            logText.BackColor = Color.White;
-            logText.Font = new Font("Consolas", 9F);
-            logsTab.Controls.Add(logText);
-            detailTabs.TabPages.Add(devicesTab);
-            detailTabs.TabPages.Add(logsTab);
-            Controls.Add(detailTabs);
-            AddButton("打开日志文件夹", 22, 630, 132, 32, (s,e) => core.OpenLogFolder(false));
-            AddButton("打开报错文件夹", 162, 630, 132, 32, (s,e) => core.OpenLogFolder(true));
-            AddLabel("关闭窗口会隐藏到托盘。退出请用托盘右键菜单。", 310, 633, 381, 24, 8F);
+            logText.BorderStyle = BorderStyle.None;
+            logText.BackColor = UiTheme.InputBg;
+            logText.ForeColor = UiTheme.TextMain;
+            logText.Font = UiTheme.FontMono;
+            logText.Visible = false;
+            bottomCard.Controls.Add(logText);
+
+            var footerNote = new Label
+            {
+                Text = "🌸 关闭窗口会自动隐藏到右下角系统托盘；完全退出请右键托盘图标选择「退出」。",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
+            };
+            footerNote.SetBounds(12, 198, 620, 20);
+            bottomCard.Controls.Add(footerNote);
+            Controls.Add(bottomCard);
 
             core.Changed += CoreChanged;
             FormClosing += (s,e) => { if (!AllowClose) { e.Cancel = true; Hide(); } };
@@ -3660,28 +4151,28 @@ namespace MicMuteBridge
             SyncFromContext();
         }
 
+        private void SwitchBottomView(bool logs)
+        {
+            showingLogs = logs;
+            micListPanel.Visible = !logs;
+            logText.Visible = logs;
+            StyleTabButton(tabMicsBtn, !logs);
+            StyleTabButton(tabLogsBtn, logs);
+            if (logs) SyncLogs();
+        }
+
+        private static void StyleTabButton(Button btn, bool active)
+        {
+            btn.Font = active ? UiTheme.FontBold : UiTheme.FontRegular;
+            btn.BackColor = active ? UiTheme.Primary : Color.White;
+            btn.ForeColor = active ? Color.White : UiTheme.SoftText;
+            btn.FlatAppearance.BorderColor = active ? UiTheme.PrimaryHover : UiTheme.SoftBorder;
+            btn.FlatAppearance.MouseOverBackColor = active ? UiTheme.PrimaryHover : UiTheme.SoftHover;
+        }
+
         private void CoreChanged(object sender, EventArgs e)
         {
             if (!IsDisposed && Visible) SyncFromContext();
-        }
-
-        private Label AddLabel(string text, int x, int y, int w, int h, float size, bool bold = false)
-        {
-            Label label = new Label();
-            label.Text = text;
-            label.SetBounds(x, y, w, h);
-            label.Font = new Font("Microsoft YaHei UI", size, bold ? FontStyle.Bold : FontStyle.Regular);
-            Controls.Add(label);
-            return label;
-        }
-        private Button AddButton(string text, int x, int y, int w, int h, EventHandler click)
-        {
-            Button button = new Button();
-            button.Text = text;
-            button.SetBounds(x, y, w, h);
-            button.Click += click;
-            Controls.Add(button);
-            return button;
         }
 
         private void FillMicChoices()
@@ -3716,25 +4207,59 @@ namespace MicMuteBridge
         {
             if (IsDisposed) return;
             syncing = true;
-            string detailValue = core.MicDetails;
-            if (micDetailText.Text != detailValue) micDetailText.Text = detailValue;
+            bool isMixedOrError = !core.MicMuted.HasValue ||
+                (core.AllMicsOn && (core.AllMicStatus.StartsWith("部分") || core.AllMicStatus.Contains("出错")));
+            bool isMuted = core.MicMuted.HasValue && core.MicMuted.Value;
+
             stateLabel.Text = core.AllMicsOn ?
                 "●  " + core.AllMicStatus :
                 !core.MicMuted.HasValue ? "○  麦克风未连接 / 未选择" :
-                core.MicMuted.Value ? "●  麦克风已静音" : "●  麦克风开启";
-            stateLabel.ForeColor = !core.MicMuted.HasValue ? Color.Gray :
-                (core.AllMicsOn && (core.AllMicStatus.StartsWith("部分") || core.AllMicStatus.Contains("出错"))) ? Color.FromArgb(190, 124, 20) :
-                core.MicMuted.Value ? Color.FromArgb(205, 65, 69) : Color.FromArgb(25, 145, 82);
-            outputLabel.Text = "自动监听的输出设备：" + core.OutputName;
-            micLabel.Text = "控制的麦克风设备：" + core.MicName;
+                isMuted ? "●  麦克风已静音" : "●  麦克风已开启";
+
+            if (isMixedOrError)
+            {
+                heroCard.FillColor = UiTheme.WarnBg;
+                heroCard.StrokeColor = UiTheme.WarnBorder;
+                stateLabel.ForeColor = UiTheme.WarnText;
+                heroToggleBtn.Text = "立即切换麦克风";
+                heroToggleBtn.BackColor = UiTheme.Primary;
+                heroToggleBtn.FlatAppearance.BorderColor = UiTheme.PrimaryHover;
+                heroToggleBtn.FlatAppearance.MouseOverBackColor = UiTheme.PrimaryHover;
+            }
+            else if (isMuted)
+            {
+                heroCard.FillColor = UiTheme.MuteBg;
+                heroCard.StrokeColor = UiTheme.MuteBorder;
+                stateLabel.ForeColor = UiTheme.MuteText;
+                heroToggleBtn.Text = "🍓 立即开麦";
+                heroToggleBtn.BackColor = UiTheme.MuteAccent;
+                heroToggleBtn.FlatAppearance.BorderColor = UiTheme.MuteText;
+                heroToggleBtn.FlatAppearance.MouseOverBackColor = UiTheme.MuteText;
+            }
+            else
+            {
+                heroCard.FillColor = UiTheme.UnmuteBg;
+                heroCard.StrokeColor = UiTheme.UnmuteBorder;
+                stateLabel.ForeColor = UiTheme.UnmuteText;
+                heroToggleBtn.Text = "🌿 立即闭麦";
+                heroToggleBtn.BackColor = UiTheme.UnmuteAccent;
+                heroToggleBtn.FlatAppearance.BorderColor = UiTheme.UnmuteText;
+                heroToggleBtn.FlatAppearance.MouseOverBackColor = UiTheme.UnmuteText;
+            }
+            heroCard.Invalidate();
+
+            outputLabel.Text = "🔊 自动监听输出：" + core.OutputName;
+            countsBadge.Text = "已切麦 " + core.Conversions + " 次";
             allMicsBox.Checked = core.AllMicsOn;
             micChoice.Enabled = !core.AllMicsOn;
-            unmuteAllButton.Enabled = core.CanRequestAllMicUnmute;
             bridgeBox.Checked = core.BridgeOn;
             soundBox.Checked = core.SoundOn;
             soundModeChoice.SelectedIndex = SoundWarmup.IndexOf(core.WarmupMs);
             startupBox.Checked = core.StartupOn;
-            counts.Text = "已转换 " + core.Conversions + " 次";
+
+            int micCount = core.AllMicsOn ? core.MicStates.Count : (core.MicMuted.HasValue ? 1 : 0);
+            tabMicsBtn.Text = "🎙️ 连接的麦克风 (" + micCount + " 台)";
+            micListPanel.RefreshRows();
             SyncLogs();
             syncing = false;
         }
@@ -3753,44 +4278,93 @@ namespace MicMuteBridge
         public SoundLibraryForm(BridgeContext context)
         {
             core = context;
-            Text = "MicMuteBridge · 音效库 / 音量调节";
-            ClientSize = new Size(700, 451);
-            MinimumSize = new Size(710, 490);
+            Text = "MicMuteBridge · 音效库与音量调节";
+            ClientSize = new Size(680, 412);
+            MinimumSize = new Size(696, 450);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            Font = new Font("Microsoft YaHei UI", 9.5F); try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-            BackColor = Color.FromArgb(248, 249, 252);
-            Label heading = new Label { Text = "选择提示音", Font = new Font("Microsoft YaHei UI", 15F, FontStyle.Bold) };
-            heading.SetBounds(20, 14, 540, 38); Controls.Add(heading);
-            Label tip = new Label { Text = "分别选择和裁剪开麦 / 闭麦声音；音量只影响提示音，不影响游戏及麦克风。" };
-            tip.SetBounds(20, 55, 660, 24); Controls.Add(tip);
+            UiTheme.StyleForm(this);
 
-            MakeRow("闭麦", muteChoice, true, 100);
-            MakeRow("开麦", unmuteChoice, false, 160);
+            var soundCard = new ThemedCard();
+            soundCard.SetBounds(16, 14, 648, 168);
+            var heading = new Label
+            {
+                Text = "🎵 选择开麦 / 闭麦提示音",
+                Font = UiTheme.FontCardTitle,
+                ForeColor = UiTheme.SoftText,
+                BackColor = Color.White
+            };
+            heading.SetBounds(16, 12, 540, 24);
+            soundCard.Controls.Add(heading);
+            var tip = new Label
+            {
+                Text = "分别选择和裁剪开麦 / 闭麦声音；内置 6 套合成音效，也支持导入自定义 WAV。",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
+            };
+            tip.SetBounds(16, 37, 610, 20);
+            soundCard.Controls.Add(tip);
 
-            Label volumeTitle = new Label { Text = "提示音音量", Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold) };
-            volumeTitle.SetBounds(20, 236, 105, 30); Controls.Add(volumeTitle);
-            volumeSlider.SetBounds(130, 223, 338, 52);
+            MakeRow(soundCard, "🍓 闭麦提示音", muteChoice, true, 68, UiTheme.MuteText);
+            MakeRow(soundCard, "🌿 开麦提示音", unmuteChoice, false, 116, UiTheme.UnmuteText);
+            Controls.Add(soundCard);
+
+            var volumeCard = new ThemedCard();
+            volumeCard.SetBounds(16, 194, 648, 152);
+            var volumeTitle = new Label
+            {
+                Text = "🔊 提示音独立音量",
+                Font = UiTheme.FontCardTitle,
+                ForeColor = UiTheme.SoftText,
+                BackColor = Color.White
+            };
+            volumeTitle.SetBounds(16, 12, 180, 24);
+            volumeCard.Controls.Add(volumeTitle);
+            var volTip = new Label
+            {
+                Text = "仅控制提示音大小，绝不影响你的游戏和系统总音量。",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
+            };
+            volTip.SetBounds(16, 37, 450, 20);
+            volumeCard.Controls.Add(volTip);
+
+            volumeSlider.SetBounds(16, 60, 410, 45);
+            volumeSlider.BackColor = Color.White;
             volumeSlider.Minimum = 0; volumeSlider.Maximum = 100;
             volumeSlider.SmallChange = 5; volumeSlider.LargeChange = 10;
             volumeSlider.TickFrequency = 10;
             volumeSlider.Value = core.SoundVolumePercent;
-            volumeValue.SetBounds(470, 232, 60, 30);
+            volumeValue.SetBounds(434, 66, 62, 28);
+            volumeValue.Font = UiTheme.FontBold;
+            volumeValue.ForeColor = UiTheme.Primary;
+            volumeValue.BackColor = Color.White;
             volumeValue.Text = volumeSlider.Value + "%";
             volumeSlider.ValueChanged += (s,e) => volumeValue.Text = volumeSlider.Value + "%";
-            Controls.Add(volumeSlider); Controls.Add(volumeValue);
-            AddButton("应用音量", 546, 225, 129, 34, (s,e) =>
+            volumeCard.Controls.Add(volumeSlider);
+            volumeCard.Controls.Add(volumeValue);
+            UiTheme.MakeButton(volumeCard, "应用音量", 506, 62, 124, 33, true, (s,e) =>
             {
                 if (!core.SetSoundVolumePercent(volumeSlider.Value))
                     volumeSlider.Value = core.SoundVolumePercent;
             });
 
-            Label note = new Label {
-                Text = "WAV 需为未压缩 PCM / 32-bit Float，最长 3 秒。裁剪不会修改原 WAV 文件；\n" +
-                       "音效会复制到本机用户配置目录，换电脑时需重新导入自定义声音。",
-                ForeColor = Color.FromArgb(95, 103, 112)
+            var note = new Label
+            {
+                Text = "注：导入的 WAV 需为未压缩 PCM / 32-bit Float（最长 3 秒），会保存在当前目录的 Settings\\Sounds 中。",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
             };
-            note.SetBounds(20, 297, 650, 48); Controls.Add(note);
-            AddButton("恢复两种默认音效", 20, 390, 190, 34, (s,e) =>
+            note.SetBounds(16, 118, 616, 22);
+            volumeCard.Controls.Add(note);
+            Controls.Add(volumeCard);
+
+            UiTheme.MakeButton(this, "恢复默认音效", 16, 360, 152, 34, false, (s,e) =>
             {
                 core.ChooseSoundPreset(true, "classic");
                 core.ChooseSoundPreset(false, "classic");
@@ -3798,17 +4372,27 @@ namespace MicMuteBridge
                 core.SetSoundTrim(false, 0, 0);
                 SyncSelections();
             });
-            AddButton("试听闭麦（无预热）", 223, 390, 171, 34, (s,e) => core.TestLegacySound());
-            AddButton("完成", 575, 390, 99, 34, (s,e) => Close());
+            UiTheme.MakeButton(this, "试听闭麦（0ms无预热）", 178, 360, 176, 34, false, (s,e) => core.TestLegacySound());
+            UiTheme.MakeButton(this, "完成", 554, 360, 110, 34, true, (s,e) => Close());
             SyncSelections();
         }
 
-        private void MakeRow(string label, ComboBox choice, bool muted, int y)
+        private void MakeRow(Control parent, string label, ComboBox choice, bool muted, int y, Color labelColor)
         {
-            Label title = new Label { Text = label + "提示音", Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold) };
-            title.SetBounds(20, y + 8, 95, 27); Controls.Add(title);
-            choice.SetBounds(110, y + 2, 239, 31);
+            var title = new Label
+            {
+                Text = label,
+                Font = UiTheme.FontBold,
+                ForeColor = labelColor,
+                BackColor = Color.White
+            };
+            title.SetBounds(16, y + 5, 112, 26);
+            parent.Controls.Add(title);
+
+            choice.SetBounds(132, y + 1, 226, 30);
             choice.DropDownStyle = ComboBoxStyle.DropDownList;
+            choice.BackColor = UiTheme.InputBg;
+            choice.ForeColor = UiTheme.TextMain;
             for (int i = 0; i < SoundCatalog.Ids.Length; i++)
                 choice.Items.Add(new PresetItem(SoundCatalog.Ids[i], SoundCatalog.Names[i]));
             choice.SelectedIndexChanged += (s,e) =>
@@ -3821,16 +4405,28 @@ namespace MicMuteBridge
                     SyncSelections();
                 }
             };
-            Controls.Add(choice);
-            AddButton("试听", 356, y + 1, 63, 32, (s,e) =>
+            parent.Controls.Add(choice);
+
+            UiTheme.MakeButton(parent, "试听", 368, y, 66, 31, false, (s,e) =>
             {
                 if (muted) core.TestSound(); else core.TestUnmuteSound();
             });
-            AddButton("裁剪…", 427, y + 1, 80, 32, (s,e) =>
+            UiTheme.MakeButton(parent, "裁剪…", 442, y, 78, 31, false, (s,e) =>
             {
+                try
+                {
+                    byte[] check = core.ReadSound(muted);
+                    WavPrep.DurationMs(check);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "无法读取音效：" + ex.Message, "MicMuteBridge",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
                 using (var editor = new SoundTrimForm(core, muted)) editor.ShowDialog(this);
             });
-            AddButton("导入 WAV…", 514, y + 1, 162, 32, (s,e) =>
+            UiTheme.MakeButton(parent, "导入 WAV…", 528, y, 104, 31, false, (s,e) =>
             {
                 using (var picker = new OpenFileDialog())
                 {
@@ -3846,11 +4442,6 @@ namespace MicMuteBridge
             });
         }
 
-        private Button AddButton(string title, int x, int y, int w, int h, EventHandler onClick)
-        {
-            Button b = new Button { Text = title };
-            b.SetBounds(x, y, w, h); b.Click += onClick; Controls.Add(b); return b;
-        }
         private void SyncSelections()
         {
             syncing = true;
@@ -3885,14 +4476,14 @@ namespace MicMuteBridge
         public SoundTrimForm(BridgeContext bridge, bool isMute)
         {
             core = bridge; muted = isMute;
-            Text = "裁剪" + (muted ? "闭麦" : "开麦") + "提示音";
-            ClientSize = new Size(600, 330);
+            Text = "✂️ 裁剪" + (muted ? "闭麦" : "开麦") + "提示音";
+            ClientSize = new Size(600, 336);
             MinimumSize = new Size(610, 365);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            Font = new Font("Microsoft YaHei UI", 9.5F); try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            UiTheme.StyleForm(this);
 
             try
             {
@@ -3907,70 +4498,91 @@ namespace MicMuteBridge
                 Shown += (s,e) => Close();
                 return;
             }
-            Label heading = new Label { Text = "选择音效片段（原始 " + duration + "ms）",
-                Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold) };
-            heading.SetBounds(20, 15, 560, 32); Controls.Add(heading);
-            Label tip = new Label { Text = "蓝色为保留片段，灰色为舍弃片段。可精确调整起点与终点。" };
-            tip.SetBounds(20, 53, 560, 24); Controls.Add(tip);
 
-            waveform.SetBounds(20, 84, 560, 86);
-            waveform.BackColor = Color.FromArgb(246, 248, 252);
+            var card = new ThemedCard();
+            card.SetBounds(16, 14, 568, 256);
+
+            var heading = new Label
+            {
+                Text = "✂️ 选择音效片段（原始时长 " + duration + "ms）",
+                Font = UiTheme.FontCardTitle,
+                ForeColor = UiTheme.SoftText,
+                BackColor = Color.White
+            };
+            heading.SetBounds(16, 12, 536, 24);
+            card.Controls.Add(heading);
+            var tip = new Label
+            {
+                Text = "香芋紫区域为保留片段，浅丁香色为舍弃片段。可精确调整起点与终点。",
+                Font = UiTheme.FontSmall,
+                ForeColor = UiTheme.TextSub,
+                BackColor = Color.White
+            };
+            tip.SetBounds(16, 38, 536, 20);
+            card.Controls.Add(tip);
+
+            waveform.SetBounds(16, 66, 536, 90);
+            waveform.BackColor = UiTheme.SubHeaderBg;
             waveform.Paint += DrawWaveform;
-            Controls.Add(waveform);
+            card.Controls.Add(waveform);
 
-            Label labelStart = new Label { Text = "从 (ms)" };
-            labelStart.SetBounds(20, 190, 85, 27); Controls.Add(labelStart);
-            start.SetBounds(112, 188, 142, 30);
+            var labelStart = new Label { Text = "起点 (ms)", BackColor = Color.White, ForeColor = UiTheme.TextMain };
+            labelStart.SetBounds(16, 174, 82, 26);
+            card.Controls.Add(labelStart);
+            start.SetBounds(102, 171, 140, 30);
+            start.BackColor = UiTheme.InputBg;
+            start.ForeColor = UiTheme.TextMain;
             start.Minimum = 0; start.Maximum = duration;
             start.Increment = 10;
-            Controls.Add(start);
-            Label labelEnd = new Label { Text = "到 (ms)" };
-            labelEnd.SetBounds(300, 190, 80, 27); Controls.Add(labelEnd);
-            end.SetBounds(386, 188, 142, 30);
+            card.Controls.Add(start);
+
+            var labelEnd = new Label { Text = "终点 (ms)", BackColor = Color.White, ForeColor = UiTheme.TextMain };
+            labelEnd.SetBounds(284, 174, 82, 26);
+            card.Controls.Add(labelEnd);
+            end.SetBounds(370, 171, 140, 30);
+            end.BackColor = UiTheme.InputBg;
+            end.ForeColor = UiTheme.TextMain;
             end.Minimum = 0; end.Maximum = duration;
             end.Increment = 10;
-            Controls.Add(end);
+            card.Controls.Add(end);
+
             int currentStart = Math.Min(core.TrimStart(muted), Math.Max(0, duration - 20));
             int currentEnd = core.TrimEnd(muted) == 0 ? duration : Math.Min(duration, core.TrimEnd(muted));
             if (currentEnd - currentStart < 20) { currentStart = 0; currentEnd = duration; }
             start.Value = currentStart;
             end.Value = currentEnd;
-            selection.SetBounds(20, 230, 560, 24);
-            Controls.Add(selection);
+            selection.SetBounds(16, 214, 536, 24);
+            selection.Font = UiTheme.FontSmallBold;
+            selection.BackColor = Color.White;
+            card.Controls.Add(selection);
+            Controls.Add(card);
+
             start.ValueChanged += (s,e) => UpdatePreview();
             end.ValueChanged += (s,e) => UpdatePreview();
             UpdatePreview();
 
-            AddButton("试听当前片段", 20, 280, 151, (s,e) =>
+            UiTheme.MakeButton(this, "试听当前片段", 16, 284, 148, 34, false, (s,e) =>
             {
                 if (TrySave())
                 {
                     if (muted) core.TestSound(); else core.TestUnmuteSound();
                 }
             });
-            AddButton("恢复完整声音", 184, 280, 151, (s,e) =>
+            UiTheme.MakeButton(this, "恢复完整声音", 174, 284, 148, 34, false, (s,e) =>
             {
                 start.Value = 0; end.Value = duration;
                 TrySave();
             });
-            AddButton("保存并关闭", 438, 280, 142, (s,e) =>
+            UiTheme.MakeButton(this, "保存并关闭", 436, 284, 148, 34, true, (s,e) =>
             {
                 if (TrySave()) Close();
             });
         }
-        private Button AddButton(string name, int x, int y, int w, EventHandler onClick)
-        {
-            Button b = new Button { Text = name };
-            b.SetBounds(x, y, w, 33);
-            b.Click += onClick;
-            Controls.Add(b);
-            return b;
-        }
         private void UpdatePreview()
         {
             int a = (int)start.Value, b = (int)end.Value;
-            selection.Text = b > a ? "片段长度：" + (b - a) + "ms" : "结束位置需要晚于开始位置";
-            selection.ForeColor = b - a >= 20 ? Color.FromArgb(20, 105, 70) : Color.DarkRed;
+            selection.Text = b > a ? "✨ 当前保留片段长度：" + (b - a) + "ms" : "⚠️ 结束位置需要晚于开始位置";
+            selection.ForeColor = b - a >= 20 ? UiTheme.SoftText : UiTheme.MuteText;
             waveform.Invalidate();
         }
         private bool TrySave()
@@ -3991,19 +4603,19 @@ namespace MicMuteBridge
             int a = (int)start.Value, b = (int)end.Value;
             int x1 = Math.Max(0, Math.Min(w, (int)(a * (double)w / duration)));
             int x2 = Math.Max(0, Math.Min(w, (int)(b * (double)w / duration)));
-            e.Graphics.Clear(Color.FromArgb(246, 248, 252));
-            using (Brush selected = new SolidBrush(Color.FromArgb(219, 240, 255)))
+            e.Graphics.Clear(Color.FromArgb(248, 245, 255));
+            using (Brush selected = new SolidBrush(Color.FromArgb(234, 224, 255)))
                 e.Graphics.FillRectangle(selected, x1, 0, Math.Max(0, x2 - x1), h);
-            using (Pen light = new Pen(Color.FromArgb(210, 218, 229)))
+            using (Pen light = new Pen(Color.FromArgb(220, 210, 245)))
                 e.Graphics.DrawLine(light, 0, h / 2, w, h / 2);
             for (int i = 0; i < peaks.Length; i++)
             {
                 int x = (int)((i + 0.5) * w / peaks.Length);
                 int amp = Math.Max(1, (int)(peaks[i] * (h / 2 - 8)));
-                using (Pen pen = new Pen(x >= x1 && x <= x2 ? Color.SteelBlue : Color.Silver, 2))
+                using (Pen pen = new Pen(x >= x1 && x <= x2 ? UiTheme.Primary : Color.FromArgb(210, 198, 242), 2))
                     e.Graphics.DrawLine(pen, x, h / 2 - amp, x, h / 2 + amp);
             }
-            using (Pen p = new Pen(Color.DodgerBlue, 2))
+            using (Pen p = new Pen(UiTheme.PrimaryHover, 2))
             {
                 e.Graphics.DrawLine(p, x1, 0, x1, h);
                 e.Graphics.DrawLine(p, x2, 0, x2, h);
@@ -4048,7 +4660,7 @@ namespace MicMuteBridge
             }
             finally
             {
-                mutex.ReleaseMutex();
+                try { mutex.ReleaseMutex(); } catch { }
                 mutex.Dispose();
             }
         }
